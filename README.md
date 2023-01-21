@@ -2,6 +2,12 @@
 
 Uses DCGAN (made from scratch) to create new Anime faces!
 
+
+
+![Sample output](./images/output1.png)
+![Sample output](./images/output2.png)
+
+
 ## How to run?
 Go to [demo.ipynb](./demo.ipynb) and run the notebook! Adjust the `NUMBER_OF_IMAGES` variable to adjust on how many images to generate.
 
