@@ -10,6 +10,7 @@ Uses DCGAN (made from scratch) to create new Anime faces!
 
 ## How to run?
 **First, download the dataset from https://www.kaggle.com/datasets/splcher/animefacedataset and extract it to datasets/anime**
+
 Go to [demo.ipynb](./demo.ipynb) and run the notebook! Adjust the `NUMBER_OF_IMAGES` variable to adjust on how many images to generate.
 
 ## Training
