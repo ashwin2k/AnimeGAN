@@ -5,12 +5,15 @@
 
 import os
 import torch.distributed as dist
+
+# os.environ["TORCH_CPP_LOG_LEVEL"] = "INFO"
+
+# os.environ["TORCH_DISTRIBUTED_DEBUG"] = "INFO"
 def setup(rank, world_size):    
     os.environ['MASTER_ADDR'] = 'localhost'
     os.environ['MASTER_PORT'] = '12355'    
     dist.init_process_group("nccl", rank=rank, world_size=world_size)
-
-
+   
 # In[2]:
 
 
@@ -130,13 +133,14 @@ def init_weights(model):
 
 
 # In[7]:
+torch.autograd.set_detect_anomaly(True, check_nan=True)
 
 
 lr=2e-4
 z_dim=100
 img_size=64
 channels_dim=3
-batch_size=128
+batch_size=256
 num_epochs=50
 
 features_disc=64
@@ -152,10 +156,13 @@ def mainwrapper(rank,world_size):
     dataloader=prepare(rank,world_size)
     disc=Discriminator(channels_dim,features_disc).to(rank) 
     gen=Generator(z_dim,channels_dim,features_gen).to(rank)
-    init_weights(disc)
-    init_weights(gen)
+    disc=nn.SyncBatchNorm.convert_sync_batchnorm(disc)
+    gen=nn.SyncBatchNorm.convert_sync_batchnorm(gen)
+    
     disc = DDP(disc, device_ids=[rank], output_device=rank)
     gen = DDP(gen, device_ids=[rank], output_device=rank)
+
+
     
     fixed_noise=torch.randn(32,z_dim,1,1).to(rank)
     opt_disc=optim.Adam(disc.parameters(),lr=lr,betas=(0.5,0.999))    
@@ -165,21 +172,25 @@ def mainwrapper(rank,world_size):
     print("TIME: ",now.strftime("%Y%m%d-%H%M%S"))
     writer_fake=SummaryWriter(f"runs/DCGAN-multiGPU/fake/"+ now.strftime("%Y%m%d-%H%M%S") + "/")
     writer_real=SummaryWriter(f"runs/DCGAN-multiGPU/real/"+ now.strftime("%Y%m%d-%H%M%S") + "/")
+    
+    step=0
     for epoch in range(num_epochs):
         dataloader.sampler.set_epoch(epoch)
         for batch_index, (real,_) in enumerate(dataloader):
+            disc.zero_grad()
             real=real.to(rank)
-            noise=torch.randn((batch_size,z_dim,1,1)).to(rank)
+            noise=torch.randn((batch_size,z_dim,1,1)).to(rank)            
             fake_img=gen(noise)
-            
+        
             disc_real=disc(real).reshape(-1)
             lossD_real=critereon(disc_real,torch.ones_like(disc_real))
-            disc_fake=disc(fake_img).reshape(-1)
+            lossD_real.backward()
+            disc_fake=disc(fake_img.detach()).reshape(-1)
             lossD_fake=critereon(disc_fake,torch.zeros_like(disc_fake))
-            lossD = (lossD_fake+lossD_real)/2
-            
-            disc.zero_grad()
-            lossD.backward(retain_graph=True)
+            lossD_fake.backward()
+
+            lossD = (lossD_fake+lossD_real)
+#             lossD.backward()
             opt_disc.step()
             
             output=disc(fake_img).reshape(-1)
@@ -188,8 +199,8 @@ def mainwrapper(rank,world_size):
             lossG.backward()
             opt_gen.step()
             
-            if(batch_index%100==0):
-                print(f'[{epoch}/{num_epochs}--Loss(D):{lossD:.4f}--Loss(G):{lossG:.4f}')
+            if(batch_index%100==0 and rank==0):
+                print(f'[{epoch}/{num_epochs}--Loss(D):{lossD.item():.4f}--Loss(G):{lossG:.4f}')
                 
             with torch.no_grad():
                 fake = gen(fixed_noise)
@@ -204,7 +215,11 @@ def mainwrapper(rank,world_size):
                 )
 
             step+=1
-            print("Next Step")
+        if(epoch%5==0 and rank==0):
+            print("Saving model")
+            torch.save(gen,'./models/gen'+str(epoch)+'.pt')
+            torch.save(disc,'./models/disc'+str(epoch)+'.pt')
+
 
 
 # In[9]:
