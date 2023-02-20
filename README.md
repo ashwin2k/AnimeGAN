@@ -3,8 +3,8 @@
 Uses DCGAN (made from scratch) to create new Anime faces!
 
 
-![Sample output](./images/output1.png)
-![Sample output](./images/output2.png)
+![Sample output](https://raw.githubusercontent.com/ashwin2k/AnimeGAN/440b5e2bf87d4a3cd05c893444dc0e41abcde25b/images/output1.png)
+![Sample output](https://raw.githubusercontent.com/ashwin2k/AnimeGAN/440b5e2bf87d4a3cd05c893444dc0e41abcde25b/images/output2.png)
 
 # Updates:
    ### 2/19/23
