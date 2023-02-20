@@ -1,0 +1,236 @@
+#!/usr/bin/env python
+# coding: utf-8
+
+# In[1]:
+
+import os
+import torch.distributed as dist
+
+# os.environ["TORCH_CPP_LOG_LEVEL"] = "INFO"
+
+# os.environ["TORCH_DISTRIBUTED_DEBUG"] = "INFO"
+def setup(rank, world_size):    
+    os.environ['MASTER_ADDR'] = 'localhost'
+    os.environ['MASTER_PORT'] = '12355'    
+    dist.init_process_group("nccl", rank=rank, world_size=world_size)
+   
+# In[2]:
+
+
+from torch.utils.data.distributed import DistributedSampler
+from torchvision.transforms import transforms
+import torchvision.datasets as datasets
+
+def prepare(rank, world_size, batch_size=32, pin_memory=False, num_workers=0):
+    transforms_img= transforms.Compose(
+    [
+        transforms.Resize((64,64)), #transforms.Resize(IMAGE_SIZE) resizes propotionally
+        transforms.ToTensor(),
+        transforms.Normalize([0.5 for _ in range(channels_dim)], [0.5 for _ in range(channels_dim)])
+    ]
+    )
+    dataset = datasets.ImageFolder(root="./datasets/anime",transform=transforms_img)
+    sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=False, drop_last=False)
+    dataloader = DataLoader(dataset, batch_size=batch_size, pin_memory=pin_memory, num_workers=num_workers, drop_last=False, shuffle=False, sampler=sampler)
+    
+    return dataloader
+
+
+# In[3]:
+
+
+import torch
+import torch.nn as nn
+from torchvision.transforms import transforms
+import torchvision.datasets as datasets
+from torch.utils.data import DataLoader
+import torch.optim as optim
+from torch.utils.tensorboard import SummaryWriter
+import torchvision
+from datetime import datetime
+import numpy as np
+
+now = datetime.now()
+
+
+# In[4]:
+
+
+class Discriminator(nn.Module):
+    def __init__(self,channels_inp,input_features):
+        super(Discriminator,self).__init__()
+        self.disc=nn.Sequential(
+            nn.Conv2d(
+                channels_inp,input_features,kernel_size=4,stride=2,padding=1
+            ),
+            nn.LeakyReLU(0.2),
+            self._block(input_features,input_features*2,4,2,1),
+            self._block(input_features*2,input_features*4,4,2,1),
+            self._block(input_features*4,input_features*8,4,2,1),
+            nn.Conv2d(input_features*8,1,kernel_size=4,stride=2,padding=0),
+            nn.Sigmoid()    
+        )
+    def _block(self,in_channels,out_channels,kernalsize,stride,padding):
+        return nn.Sequential(
+        nn.Conv2d(
+            in_channels=in_channels,
+            out_channels=out_channels,
+            kernel_size=kernalsize,
+            stride=stride,
+            padding=padding,
+            bias=False
+        ),
+        nn.BatchNorm2d(out_channels),
+        nn.LeakyReLU(0.2)
+        )
+    def forward(self,x):
+        return self.disc(x)
+        
+
+
+# In[5]:
+
+
+class Generator(nn.Module):
+    def __init__(self,z_dim,channels_img,input_features):
+        super(Generator,self).__init__()
+        self.net = nn.Sequential(   
+            self._block(z_dim,input_features*16,4,1,0),
+            self._block(input_features*16,input_features*8,4,2,1),
+            self._block(input_features*8,input_features*4,4,2,1),
+            self._block(input_features*4,input_features*2,4,2,1),
+            nn.ConvTranspose2d(
+                input_features*2,channels_img,kernel_size=4,stride=2,padding=1
+            ),
+            nn.Tanh()
+
+        )   
+    def _block(self,in_channels,out_channels,kernalsize,stride,padding):
+        return nn.Sequential(
+            nn.ConvTranspose2d(
+                in_channels,
+                out_channels,
+                kernalsize,
+                stride,
+                padding,
+                bias=False
+            ),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU()
+        )
+    def forward(self,x):
+        return self.net(x)
+        ""
+
+
+# In[6]:
+
+
+def init_weights(model):
+    for m in model.modules():
+        if isinstance(m,(nn.Conv2d,nn.ConvTranspose2d,nn.BatchNorm2d)):
+            nn.init.normal_(m.weight.data,0.0,0.02)
+
+
+# In[7]:
+torch.autograd.set_detect_anomaly(True, check_nan=True)
+
+
+lr=2e-4
+z_dim=100
+img_size=64
+channels_dim=3
+batch_size=256
+num_epochs=50
+
+features_disc=64
+features_gen=64
+
+
+# In[8]:
+
+
+from torch.nn.parallel import DistributedDataParallel as DDP
+def mainwrapper(rank,world_size):
+    setup(rank,world_size)
+    dataloader=prepare(rank,world_size)
+    disc=Discriminator(channels_dim,features_disc).to(rank) 
+    gen=Generator(z_dim,channels_dim,features_gen).to(rank)
+    disc=nn.SyncBatchNorm.convert_sync_batchnorm(disc)
+    gen=nn.SyncBatchNorm.convert_sync_batchnorm(gen)
+    
+    disc = DDP(disc, device_ids=[rank], output_device=rank)
+    gen = DDP(gen, device_ids=[rank], output_device=rank)
+
+
+    
+    fixed_noise=torch.randn(32,z_dim,1,1).to(rank)
+    opt_disc=optim.Adam(disc.parameters(),lr=lr,betas=(0.5,0.999))    
+    opt_gen=optim.Adam(gen.parameters(),lr=lr,betas=(0.5,0.999))
+    critereon=nn.BCELoss()
+    
+    print("TIME: ",now.strftime("%Y%m%d-%H%M%S"))
+    writer_fake=SummaryWriter(f"runs/DCGAN-multiGPU/fake/"+ now.strftime("%Y%m%d-%H%M%S") + "/")
+    writer_real=SummaryWriter(f"runs/DCGAN-multiGPU/real/"+ now.strftime("%Y%m%d-%H%M%S") + "/")
+    
+    step=0
+    for epoch in range(num_epochs):
+        dataloader.sampler.set_epoch(epoch)
+        for batch_index, (real,_) in enumerate(dataloader):
+            disc.zero_grad()
+            real=real.to(rank)
+            noise=torch.randn((batch_size,z_dim,1,1)).to(rank)            
+            fake_img=gen(noise)
+        
+            disc_real=disc(real).reshape(-1)
+            lossD_real=critereon(disc_real,torch.ones_like(disc_real))
+            lossD_real.backward()
+            disc_fake=disc(fake_img.detach()).reshape(-1)
+            lossD_fake=critereon(disc_fake,torch.zeros_like(disc_fake))
+            lossD_fake.backward()
+
+            lossD = (lossD_fake+lossD_real)
+#             lossD.backward()
+            opt_disc.step()
+            
+            output=disc(fake_img).reshape(-1)
+            lossG=critereon(output,torch.ones_like(output))
+            gen.zero_grad()
+            lossG.backward()
+            opt_gen.step()
+            
+            if(batch_index%100==0):
+                print(f'[{epoch}/{num_epochs}--Loss(D):{lossD.item():.4f}--Loss(G):{lossG:.4f}')
+                
+            with torch.no_grad():
+                fake = gen(fixed_noise)
+                img_grid_fake=torchvision.utils.make_grid(fake[:32],normalize=True)
+                img_grid_real=torchvision.utils.make_grid(real[:32],normalize=True)
+
+                writer_fake.add_image(
+                    "Fake img1",img_grid_fake,global_step=step
+                )
+                writer_real.add_image(
+                    "Real img1",img_grid_real,global_step=step
+                )
+
+            step+=1
+        if(epoch%5==0):
+            print("Saving model")
+            torch.save(gen,'./models/gen'+str(epoch)+'.pt')
+            torch.save(disc,'./models/disc'+str(epoch)+'.pt')
+
+
+
+# In[9]:
+
+
+import torch.multiprocessing as mp
+if __name__ == '__main__':
+    # suppose we have 3 gpus
+    world_size = 2
+    mp.spawn(
+        mainwrapper,
+        args=(world_size,),
+        nprocs=world_size
+    )
